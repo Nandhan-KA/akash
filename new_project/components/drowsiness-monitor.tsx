@@ -1,639 +1,579 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useRef } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { Progress } from "@/components/ui/progress"
 import { Badge } from "@/components/ui/badge"
-import { Eye, EyeOff, AlertTriangle, Loader2, PlayCircle, Server, Smartphone } from "lucide-react"
-import axios from 'axios'
-import { Switch } from "@/components/ui/switch"
-import { Label } from "@/components/ui/label"
-// @ts-ignore
-import { Button, Stack, Typography, CircularProgress, Alert, Box, Snackbar } from '@mui/material'
-// @ts-ignore
-import WarningIcon from '@mui/icons-material/Warning'
-// @ts-ignore
-import VideocamIcon from '@mui/icons-material/Videocam'
-// @ts-ignore
-import VideocamOffIcon from '@mui/icons-material/VideocamOff'
-// @ts-ignore
-import PsychologyIcon from '@mui/icons-material/Psychology'
-// @ts-ignore
-import SettingsIcon from '@mui/icons-material/Settings'
-// @ts-ignore
-import ScienceIcon from '@mui/icons-material/Science'
-import DrowsinessDetectionController from '../utils/drowsinessDetectionController'
+import { Eye, EyeOff, AlertTriangle, Loader2 } from "lucide-react"
+import * as faceapi from 'face-api.js'
+
+// Initialize face-api.js environment
+if (typeof window !== 'undefined') {
+  faceapi.env.monkeyPatch({
+    Canvas: HTMLCanvasElement,
+    Image: HTMLImageElement,
+    ImageData: ImageData,
+    Video: HTMLVideoElement,
+    createCanvasElement: () => document.createElement('canvas'),
+    createImageElement: () => document.createElement('img')
+  });
+}
+
+// Constants
+const EAR_THRESHOLD = 0.22;  // Eye Aspect Ratio threshold for drowsiness
+const BLINK_THRESHOLD = 0.27;  // Threshold for detecting blinks based on observed values
+const DROWSY_TIME_THRESHOLD = 3000;  // Time in ms for eyes to be closed to trigger drowsiness alert (3 seconds)
+const HEAD_NOD_THRESHOLD = 0.15;  // Threshold for detecting head nodding (vertical movement)
+const HEAD_SAMPLES = 20;  // Number of samples to track head position
+const SOS_TRIGGER_THRESHOLD = 5;  // Number of drowsiness events to trigger SOS
 
 export function DrowsinessMonitor() {
-  const [isWebcamActive, setIsWebcamActive] = useState(false)
+  // State
+  const [isActive, setIsActive] = useState(false)
   const [drowsinessLevel, setDrowsinessLevel] = useState(10)
   const [earValue, setEarValue] = useState(0.32)
   const [blinkCount, setBlinkCount] = useState(0)
-  const [yawnCount, setYawnCount] = useState(0)
-  const [headPose, setHeadPose] = useState({ x: 0, y: 0, z: 0 })
   const [alertStatus, setAlertStatus] = useState("normal")
-  const [isConnecting, setIsConnecting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [faceDetected, setFaceDetected] = useState(false)
-  const [apiStatus, setApiStatus] = useState<"idle" | "connecting" | "connected" | "failed">("idle")
-  const [streamUrl, setStreamUrl] = useState<string | null>(null)
-  const [isLocalMode, setIsLocalMode] = useState(false)
-  const [preferLocalMode, setPreferLocalMode] = useState(false)
-  const [detectionMode, setDetectionMode] = useState('local')
-  const [switchingMode, setSwitchingMode] = useState(false)
-  const [isPythonMode, setIsPythonMode] = useState(false)
-  const [isInitializing, setIsInitializing] = useState(false)
-  const [isDetecting, setIsDetecting] = useState(false)
-  const [isConnected, setIsConnected] = useState(false)
-  
-  const imageRef = useRef<HTMLImageElement>(null)
+  const [isModelLoading, setIsModelLoading] = useState(false)
+  const [modelsLoaded, setModelsLoaded] = useState(false)
+  const [sosAlertActive, setSosAlertActive] = useState(false)
+  const [nodCount, setNodCount] = useState(0)
+
+  // Refs
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const animationRef = useRef<number | null>(null)
-  const errorCountRef = useRef<number>(0)
+  
+  // Detection variables
+  const earBufferRef = useRef<number[]>([]);
+  const closedEyeFramesRef = useRef<number>(0);
+  const previousEyeStateRef = useRef<string>('open');
+  const lastBlinkTimestampRef = useRef<number>(0);
+  const eyeClosureStartTimeRef = useRef<number>(0);
+  const headPositionBufferRef = useRef<{y: number, roll: number}[]>([]);
+  const drowsinessEventsRef = useRef<number>(0);
+  const sosTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const isNodDetectedRef = useRef<boolean>(false);
+  const lastNodTimestampRef = useRef<number>(0);
 
-  // API base URL
-  const API_BASE_URL = 'http://localhost:5000';
-
-  // Clean up resources to prevent memory leaks and stuck camera
-  const cleanupResources = () => {
-    // Clear intervals and animation frames
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
-    }
-    
-    if (animationRef.current) {
-      cancelAnimationFrame(animationRef.current);
-      animationRef.current = null;
-    }
-    
-    // Stop webcam stream if active
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => {
-        track.stop();
-      });
-      videoRef.current.srcObject = null;
-    }
-    
-    // Reset image source to prevent frozen frames
-    if (imageRef.current) {
-      imageRef.current.src = '';
-    }
-  };
-
-  // Connect to Python backend
-  const connectToPythonBackend = async () => {
-    try {
-      // Check if the API server is online
-      let isServerOnline = false;
+  // Load face-api.js models
+  useEffect(() => {
+    const loadModels = async () => {
       try {
-        const response = await axios.get(`${API_BASE_URL}/api/status`, {
-          timeout: 5000, // 5 second timeout
-          headers: {
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
-          }
-        });
+        setIsModelLoading(true);
         
-        isServerOnline = response.data && response.data.status === 'online';
+        // Load required models
+        await faceapi.loadTinyFaceDetectorModel('/models/face-api');
+        await faceapi.loadFaceLandmarkModel('/models/face-api');
+        
+        console.log("Face-API models loaded successfully");
+        setModelsLoaded(true);
+        setError(null);
       } catch (error) {
-        console.warn("API server is not online or not responding:", error);
-        // Don't throw here, we'll handle it below
+        console.error("Error loading face-api.js models:", error);
+        setError("Failed to load facial detection models. Please refresh the page and try again.");
+      } finally {
+        setIsModelLoading(false);
       }
-      
-      if (isServerOnline) {
-        // Try to start the drowsiness detection
-        try {
-          const startResponse = await axios.get(`${API_BASE_URL}/api/start-drowsiness-detection`, {
-            timeout: 5000,
-            headers: {
-              'Cache-Control': 'no-cache',
-              'Pragma': 'no-cache'
-            }
-          });
-          
-          if (startResponse.data && startResponse.data.success) {
-            setIsLocalMode(false);
-            errorCountRef.current = 0;
-            
-            // Set the video stream URL with a timestamp to prevent caching
-            setStreamUrl(`${API_BASE_URL}/video_feed?timestamp=${Date.now()}`);
-            
-            // Setup polling for drowsiness data
-            startDataPolling();
-            return true;
-          } else {
-            console.warn("Failed to start detection:", startResponse.data.message);
-            throw new Error(startResponse.data.message || 'Failed to start drowsiness detection');
-          }
-        } catch (startError) {
-          console.error("Error starting drowsiness detection:", startError);
-          throw new Error('Failed to start drowsiness detection on the server');
-        }
-      } else {
-        console.warn("API server is not online, falling back to local mode");
-        // Fall back to local mode
-        setIsLocalMode(true);
-        return await startLocalDetection();
-      }
-    } catch (error: any) {
-      console.error("Error connecting to Python backend:", error);
-      
-      // More descriptive error message for user
-      const errorMessage = error.message || 'Failed to connect to drowsiness detection service';
-      setError(errorMessage);
-      
-      // Fall back to local mode if possible
-      console.log("Falling back to local mode due to connection error");
-      setIsLocalMode(true);
-      return await startLocalDetection();
-    }
-  };
-  
-  // Disconnect from Python backend
-  const disconnectFromPythonBackend = async () => {
-    try {
-      // Stop polling for data
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
-      
-      // Only call the API if we're connected to it
-      if (apiStatus === "connected") {
-        try {
-          // Stop the drowsiness detection service
-          await axios.get(`${API_BASE_URL}/api/stop-drowsiness-detection`, { timeout: 3000 });
-        } catch (error: any) {
-          console.warn("Error stopping remote detection, but continuing cleanup:", error);
-        }
-      }
-      
-      // Stop local detection if active
-      if (isLocalMode) {
-        stopLocalDetection();
-      }
-      
-      // Full cleanup to prevent stuck cameras
-      cleanupResources();
-      
-      // Reset state
-      setStreamUrl(null);
-      setApiStatus("idle");
-      setIsLocalMode(false);
-      setError(null);
-    } catch (error: any) {
-      console.error("Error disconnecting:", error);
-    }
-  };
-  
-  // Poll for drowsiness data from Python backend
-  const startDataPolling = () => {
-    // Clear any existing interval
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
+    };
+
+    // Only load models in browser environment
+    if (typeof window !== 'undefined') {
+      loadModels();
     }
     
-    // Set up polling interval (every 500ms)
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const response = await axios.get(`${API_BASE_URL}/api/drowsiness-data`, { timeout: 2000 });
-        const data = response.data;
+    return () => {
+      // Cleanup if component unmounts
+      if (isActive) {
+        // Stop animation frame
+        if (animationRef.current) {
+          cancelAnimationFrame(animationRef.current);
+          animationRef.current = null;
+        }
         
-        if (data) {
-          // Reset error counter on successful request
-          errorCountRef.current = 0;
-          
-          // Update state with new data
-          setEarValue(data.ear || earValue);
-          setBlinkCount(data.blink_count || blinkCount);
-          setYawnCount(data.yawn_count || yawnCount);
-          setDrowsinessLevel(data.drowsiness_level || drowsinessLevel);
-          setFaceDetected(data.face_detected || false);
-          
-          // Set head pose if available
-          if (data.head_pose) {
-      setHeadPose({
-              x: data.head_pose.x || 0,
-              y: data.head_pose.y || 0,
-              z: data.head_pose.z || 0
+        // Stop webcam
+        if (videoRef.current && videoRef.current.srcObject) {
+          const stream = videoRef.current.srcObject as MediaStream;
+          stream.getTracks().forEach(track => track.stop());
+          videoRef.current.srcObject = null;
+        }
+        
+        setIsActive(false);
+      }
+    };
+  }, [isActive]);
+
+  // Added useEffect to handle video initialization similar to emotion-display
+  useEffect(() => {
+    if (isActive) {
+      const startDetectionLoop = async () => {
+        // Check if models are loaded
+        if (!modelsLoaded) {
+          // Models will be loaded in the first useEffect - just wait
+          return;
+        }
+        
+        // Setup webcam
+        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              video: {
+                width: { ideal: 640 },
+                height: { ideal: 480 },
+                facingMode: "user"
+              }
             });
+
+            if (videoRef.current) {
+              videoRef.current.srcObject = stream;
+              videoRef.current.play();
+            }
+
+            // Reset detection state
+            resetDetectionState();
+            
+            // Start detection loop
+            detectDrowsiness();
+          } catch (error) {
+            console.error("Error accessing webcam:", error);
+            setError("Failed to access webcam. Please check permissions and try again.");
+          }
+        } else {
+          setError("Your browser doesn't support webcam access. Please try a different browser.");
+        }
+      };
+
+      startDetectionLoop();
+
+      return () => {
+        // Cleanup
+        if (animationRef.current) {
+          cancelAnimationFrame(animationRef.current);
+        }
+
+        // Stop webcam
+        if (videoRef.current && videoRef.current.srcObject) {
+          const stream = videoRef.current.srcObject as MediaStream;
+          stream.getTracks().forEach(track => track.stop());
+        }
+      };
+    }
+  }, [isActive, modelsLoaded]);
+
+  // Calculate Eye Aspect Ratio from landmarks
+  const calculateEAR = (landmarks: any) => {
+    try {
+      // Get eye landmarks
+      const leftEye = landmarks.getLeftEye();
+      const rightEye = landmarks.getRightEye();
+      
+      // Calculate EAR for left eye
+      const leftEAR = calculateEyeAspectRatio(leftEye);
+      
+      // Calculate EAR for right eye
+      const rightEAR = calculateEyeAspectRatio(rightEye);
+      
+      // Return average EAR
+      return (leftEAR + rightEAR) / 2.0;
+    } catch (error) {
+      console.error("Error calculating EAR:", error);
+      return 0.3; // Default value for open eyes
+    }
+  };
+
+  // Calculate EAR for a single eye
+  const calculateEyeAspectRatio = (eye: any[]) => {
+    try {
+      // Calculate euclidean distance between points
+      const v1 = distance(eye[1], eye[5]); // top to bottom at left side
+      const v2 = distance(eye[2], eye[4]); // top to bottom at right side
+      const h = distance(eye[0], eye[3]); // left to right corners
+      
+      // Return EAR
+      if (h === 0) return 0.3; // Avoid division by zero
+      return (v1 + v2) / (2.0 * h);
+    } catch (error) {
+      console.error("Error calculating single eye EAR:", error);
+      return 0.3;
+    }
+  };
+
+  // Calculate distance between two points
+  const distance = (p1: any, p2: any) => {
+    return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+  };
+
+  // Reset detection state
+  const resetDetectionState = () => {
+    earBufferRef.current = [];
+    closedEyeFramesRef.current = 0;
+    previousEyeStateRef.current = 'open';
+    lastBlinkTimestampRef.current = 0;
+    eyeClosureStartTimeRef.current = 0;
+    headPositionBufferRef.current = [];
+    drowsinessEventsRef.current = 0;
+    isNodDetectedRef.current = false;
+    lastNodTimestampRef.current = 0;
+    setBlinkCount(0);
+    setDrowsinessLevel(10);
+    setAlertStatus("normal");
+    setSosAlertActive(false);
+    setNodCount(0);
+    
+    // Clear any existing SOS timeout
+    if (sosTimeoutRef.current) {
+      clearTimeout(sosTimeoutRef.current);
+      sosTimeoutRef.current = null;
+    }
+  };
+
+  // Detect drowsiness
+  const detectDrowsiness = async () => {
+    if (!videoRef.current || !canvasRef.current || !videoRef.current.readyState) {
+      // Schedule next frame if active but video not ready
+      if (isActive) {
+        animationRef.current = requestAnimationFrame(detectDrowsiness);
+      }
+      return;
+    }
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const displaySize = { width: video.videoWidth, height: video.videoHeight };
+
+    // Match canvas size to video
+    if (canvas.width !== displaySize.width || canvas.height !== displaySize.height) {
+      faceapi.matchDimensions(canvas, displaySize);
+    }
+
+    try {
+      // Detect faces with landmarks using detectAllFaces instead of detectSingleFace
+      const detections = await faceapi
+        .detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
+        .withFaceLandmarks();
+
+      // Draw results on canvas
+      const ctx = canvas.getContext("2d");
+      if (ctx) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // First draw the video frame
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        if (detections && detections.length > 0) {
+          // Face detected - we take the first face detected
+          const detection = detections[0];
+          setFaceDetected(true);
+          
+          // Draw face landmarks
+          const resizedDetection = faceapi.resizeResults(detection, displaySize);
+          
+          // Draw just the face mesh
+          faceapi.draw.drawFaceLandmarks(canvas, resizedDetection);
+          
+          // Get landmarks data for eye visualization
+          const landmarks = resizedDetection.landmarks;
+          const leftEye = landmarks.getLeftEye();
+          const rightEye = landmarks.getRightEye();
+          
+          // Highlight the eyes with custom drawing
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = '#00FFFF'; // Cyan color for eye outlines
+          
+          // Draw left eye
+          ctx.beginPath();
+          ctx.moveTo(leftEye[0].x, leftEye[0].y);
+          for (let i = 1; i < leftEye.length; i++) {
+            ctx.lineTo(leftEye[i].x, leftEye[i].y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+          
+          // Draw right eye
+          ctx.beginPath();
+          ctx.moveTo(rightEye[0].x, rightEye[0].y);
+          for (let i = 1; i < rightEye.length; i++) {
+            ctx.lineTo(rightEye[i].x, rightEye[i].y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+
+          // Calculate EAR
+          const ear = calculateEAR(resizedDetection.landmarks);
+          setEarValue(Number(ear.toFixed(2)));
+          
+          // Add to buffer for smoother detection
+          earBufferRef.current.push(ear);
+          if (earBufferRef.current.length > 10) { // Keep last 10 frames
+            earBufferRef.current.shift();
           }
           
-          // Update alert status based on drowsiness level
-          if (data.drowsiness_level > 70) {
+          // Calculate moving average
+          const avgEAR = earBufferRef.current.reduce((a, b) => a + b, 0) / earBufferRef.current.length;
+          
+          // Update eye state (open/closed)
+          const currentEyeState = avgEAR < BLINK_THRESHOLD ? 'closed' : 'open';
+          
+          // Create a dynamic threshold based on eye baseline
+          // This helps adjust to different users with different eye openness
+          if (earBufferRef.current.length === 10 && avgEAR > BLINK_THRESHOLD) {
+            // If eyes have been consistently open for 10 frames, establish a new baseline
+            const baselineEAR = avgEAR * 0.9; // 90% of open eyes value as threshold
+            console.log("Setting dynamic blink threshold:", baselineEAR);
+          }
+          
+          // Blink detection - improved logic
+          if (previousEyeStateRef.current === 'open' && currentEyeState === 'closed') {
+            // Eye just closed - potential start of a blink
+            closedEyeFramesRef.current = 1;
+            // Record the time when eyes first closed (for drowsiness detection)
+            eyeClosureStartTimeRef.current = Date.now();
+            console.log("Eye closed detected, EAR:", avgEAR);
+            
+            // Visual cue for eye closure
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+            ctx.fillText("EYES CLOSING", 10, 120);
+          } else if (currentEyeState === 'closed') {
+            // Continuing eye closure
+            closedEyeFramesRef.current++;
+            
+            // Check for prolonged eye closure (drowsiness)
+            const closureDuration = Date.now() - eyeClosureStartTimeRef.current;
+            
+            console.log("Eyes still closed, duration:", closureDuration + "ms");
+            
+            // Visual feedback for closed eyes
+            ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+            ctx.fillText("EYES CLOSED: " + closedEyeFramesRef.current + " (" + Math.round(closureDuration/1000) + "s)", 10, 120);
+            
+            // Check if eye closure exceeds drowsiness threshold
+            if (closureDuration > DROWSY_TIME_THRESHOLD) {
+              // Prolonged eye closure detected - this is drowsiness
+              drowsinessEventsRef.current++;
+              console.log(`Drowsiness event detected! Count: ${drowsinessEventsRef.current}`);
+              
+              // Visual alert for drowsiness
+              ctx.fillStyle = "#FF0000";
+              ctx.font = "24px Arial Bold";
+              ctx.fillText("DROWSINESS DETECTED!", canvas.width / 2 - 150, 30);
+              ctx.fillText(`Eyes closed for ${Math.round(closureDuration/1000)}s`, canvas.width / 2 - 120, 60);
+              
+              // Reset the start time to avoid triggering multiple times for the same closure
+              eyeClosureStartTimeRef.current = Date.now();
+              
+              // Update drowsiness level more aggressively
+              setDrowsinessLevel(prev => Math.min(100, prev + 20));
+              
+              if (drowsinessEventsRef.current >= SOS_TRIGGER_THRESHOLD) {
+                triggerSOSAlert();
+              }
+            }
+          } else if (previousEyeStateRef.current === 'closed' && currentEyeState === 'open') {
+            // End of eye closure - check if it was a blink
+            const now = Date.now();
+            // More lenient blink detection (1-10 frames)
+            if (closedEyeFramesRef.current >= 1 && 
+                closedEyeFramesRef.current <= 10 && // Allow for slightly longer blinks
+                now - lastBlinkTimestampRef.current > 300) { // Allow more frequent blinks
+              setBlinkCount(prev => prev + 1);
+              lastBlinkTimestampRef.current = now;
+              console.log("Blink detected! Total:", blinkCount + 1);
+              
+              // Visual feedback for blink
+              ctx.fillStyle = "#00FF00";
+              ctx.font = "20px Arial Bold";
+              ctx.fillText("BLINK DETECTED!", canvas.width / 2 - 100, 60);
+            }
+            closedEyeFramesRef.current = 0;
+            eyeClosureStartTimeRef.current = 0;
+          }
+          
+          previousEyeStateRef.current = currentEyeState;
+          
+          // Detect head nodding
+          const isNodding = detectHeadNodding(resizedDetection.landmarks);
+          
+          if (isNodding) {
+            console.log("Head nodding detected!");
+            
+            // Visual feedback for head nodding
+            ctx.fillStyle = "#FF9900";
+            ctx.font = "20px Arial Bold";
+            ctx.fillText("HEAD NODDING DETECTED!", canvas.width / 2 - 150, 90);
+            
+            // Increase drowsiness level when nodding is detected
+            setDrowsinessLevel(prev => Math.min(100, prev + 15));
+            
+            // Increment drowsiness events for severe nodding
+            drowsinessEventsRef.current++;
+            
+            if (drowsinessEventsRef.current >= SOS_TRIGGER_THRESHOLD) {
+              triggerSOSAlert();
+            }
+          }
+          
+          // Determine drowsiness
+          const isDrowsy = avgEAR < EAR_THRESHOLD;
+          
+          // Update drowsiness level
+          if (isDrowsy) {
+            setDrowsinessLevel(prev => Math.min(100, prev + 5));
+          } else {
+            setDrowsinessLevel(prev => Math.max(0, prev - 1));
+          }
+          
+          // Update alert status
+          if (drowsinessLevel > 70) {
             setAlertStatus("high");
-          } else if (data.drowsiness_level > 40) {
+          } else if (drowsinessLevel > 40) {
             setAlertStatus("medium");
           } else {
             setAlertStatus("normal");
           }
-        }
-      } catch (error: any) {
-        console.error("Error fetching drowsiness data:", error);
-        
-        // Increment error counter
-        errorCountRef.current += 1;
-        
-        // If we've failed to connect to the API several times, switch to local mode
-        if (apiStatus === "connected" && errorCountRef.current > 5) {
-          setApiStatus("failed");
-          setError("Lost connection to Python backend. Switching to browser-based detection.");
-          setIsLocalMode(true);
           
-          // Stop polling and start local detection
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
+          // Draw EAR value and blink count
+          ctx.fillStyle = "#4ADE80";
+          ctx.font = "16px Arial";
+          ctx.fillText(`EAR: ${avgEAR.toFixed(2)}`, 10, 30);
+          ctx.fillText(`Blinks: ${blinkCount}`, 10, 60);
+          ctx.fillText(`Threshold: ${BLINK_THRESHOLD}`, 10, 90);
+          
+          // Draw drowsiness indicators
+          if (isDrowsy) {
+            ctx.fillStyle = "#EF4444";
+            ctx.font = "20px Arial Bold";
+            ctx.fillText("LOW EAR VALUE!", canvas.width / 2 - 120, 30);
           }
-          
-          // Clean up the stuck video feed
-          if (imageRef.current) {
-            imageRef.current.src = '';
-          }
-          setStreamUrl(null);
-          
-          startLocalDetection();
-        }
-      }
-    }, 500);
-  };
-
-  // Start browser-based local detection
-  const startLocalDetection = async () => {
-    try {
-      // Wait for a short delay to ensure React has rendered the video element
-      await new Promise(resolve => setTimeout(resolve, 100));
-      
-      // If videoRef is not available, try to handle it gracefully
-      if (!videoRef.current) {
-        console.warn("Video element ref not found, attempting to create a fallback video element");
-        
-        // Create a new video element to work with
-        const fallbackVideo = document.createElement("video");
-        fallbackVideo.autoplay = true;
-        fallbackVideo.muted = true;
-        fallbackVideo.playsInline = true;
-        
-        // Attempt to add it to the DOM temporarily to ensure it works
-        const container = document.querySelector(".aspect-video");
-        if (container) {
-          fallbackVideo.style.display = "none";
-          container.appendChild(fallbackVideo);
-          videoRef.current = fallbackVideo;
         } else {
-          console.error("Video element not found and no suitable container for fallback");
-          setError("Video element not found. Please reload the page and try again.");
-          return;
+          // No face detected
+          setFaceDetected(false);
         }
       }
-      
-      // Stop any existing streams
-      if (videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
-        videoRef.current.srcObject = null;
-      }
-      
-      const constraints = {
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          facingMode: "user",
-        },
-      };
-      
-      // Request camera access
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      videoRef.current.srcObject = stream;
-      
-      // Add event listener for when video is ready
-      videoRef.current.onloadedmetadata = () => {
-        if (videoRef.current) {
-          videoRef.current.play()
-            .then(() => {
-              console.log("Video playback started successfully");
-              // When video is ready, try to initialize the detection controller
-              if (isLocalMode) {
-                // Start simulation
-                simulateDetection();
-              } else {
-                // Initialize the detection controller now that video is ready
-                initializeDetectionController();
-              }
-            })
-            .catch((error: Error) => {
-              console.error("Error starting video playback:", error);
-              setError("Error starting video: " + error.message);
-            });
-        }
-      };
-      
-      // Handle errors
-      videoRef.current.onerror = (event) => {
-        console.error("Video element error:", event);
-        setError("Video error: Please check camera permissions");
-      };
-    } catch (error: any) {
-      console.error("Error starting video:", error);
-      setError("Could not access webcam. Please check permissions. Error: " + error.message);
+    } catch (error) {
+      console.error("Error in detection:", error);
+    }
+
+    // Continue detection loop
+    if (isActive) {
+      animationRef.current = requestAnimationFrame(detectDrowsiness);
     }
   };
-  
-  // Initialize the detection controller after video is ready
-  const initializeDetectionController = async () => {
+
+  // Detect head nodding by analyzing vertical movement
+  const detectHeadNodding = (landmarks: any) => {
     try {
-      setIsInitializing(true);
-      setError(null);
+      const nose = landmarks.getNose()[0]; // Get nose tip position
+      const jawline = landmarks.getJawOutline();
+      const topOfHead = jawline[16]; // Top point of jawline outline
       
-      if (!videoRef.current || !videoRef.current.readyState) {
-        throw new Error('Video element not ready');
-      }
+      // Calculate face angle/roll from the line connecting nose and top of head
+      const dx = topOfHead.x - nose.x;
+      const dy = topOfHead.y - nose.y;
+      const roll = Math.atan2(dx, dy) * (180 / Math.PI);
       
-      // For local mode, check if TensorFlow.js is available
-      if (isLocalMode && !isTensorFlowAvailable()) {
-        throw new Error('TensorFlow.js not found. Required for browser-based detection.');
-      }
-      
-      await DrowsinessDetectionController.initialize({
-        mode: isLocalMode ? 'local' : 'backend',
-        backendUrl: 'http://localhost:5000/detect',
-        modelPath: '/models/drowsiness',
-        detectionFrequency: 100 // 10 times per second
+      // Add current head position to buffer
+      headPositionBufferRef.current.push({
+        y: nose.y,
+        roll: roll
       });
       
-      const success = await DrowsinessDetectionController.startDetection(
-        videoRef.current,
-        (data: any) => {
-          // Update UI with drowsiness data
-          if (data) {
-            setEarValue(data.ear || earValue);
-            setBlinkCount(data.blink_count || blinkCount);
-            setYawnCount(data.yawn_count || yawnCount);
-            setDrowsinessLevel(data.drowsiness_level || drowsinessLevel);
-            setFaceDetected(data.face_detected || false);
-
-      // Update alert status based on drowsiness level
-            if (data.drowsiness_level > 70) {
-              setAlertStatus("high");
-            } else if (data.drowsiness_level > 40) {
-              setAlertStatus("medium");
-            } else {
-              setAlertStatus("normal");
-            }
-          }
-        }
-      );
-      
-      if (!success) {
-        throw new Error('Failed to start drowsiness detection');
+      // Keep buffer size limited
+      if (headPositionBufferRef.current.length > HEAD_SAMPLES) {
+        headPositionBufferRef.current.shift();
       }
       
-      setIsDetecting(true);
-      setIsConnected(true);
-    } catch (error: any) {
-      console.error('Error initializing drowsiness detection:', error);
-      setError(`Failed to initialize detection: ${error.message || 'Unknown error'}`);
-    } finally {
-      setIsInitializing(false);
-    }
-  };
-  
-  // Stop local detection
-  const stopLocalDetection = () => {
-    // Stop animation frame
-    if (animationRef.current) {
-      cancelAnimationFrame(animationRef.current);
-      animationRef.current = null;
-    }
-    
-    // Stop webcam
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
-      videoRef.current.srcObject = null;
-    }
-  };
-  
-  // Simulate drowsiness detection with random values
-  const simulateDetection = () => {
-    // Create a simple simulation that updates values
-    if (!videoRef.current || !canvasRef.current) return;
-    
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    
-    // Draw video on canvas
-    const context = canvas.getContext('2d');
-    if (!context) return;
-    
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    
-    const drawVideoFrame = () => {
-      try {
-        // Draw video frame
-        context.drawImage(video, 0, 0, canvas.width, canvas.height);
-        
-        // Simulated values based on time
-        const time = Date.now() / 1000;
-        const simulatedEAR = 0.25 + 0.1 * Math.sin(time);
-        
-        // Simulate blinks
-        if (Math.random() > 0.95) {
-          setBlinkCount(prev => prev + 1);
-        }
-        
-        // Simulate yawns less frequently
-        if (Math.random() > 0.99) {
-          setYawnCount(prev => prev + 1);
-        }
-        
-        // Update EAR value
-        setEarValue(Number(simulatedEAR.toFixed(2)));
-        
-        // Calculate drowsiness level based on EAR
-        let newDrowsinessLevel = drowsinessLevel;
-        
-        if (simulatedEAR < 0.25) {
-          newDrowsinessLevel = Math.min(100, newDrowsinessLevel + 5);
-        } else {
-          newDrowsinessLevel = Math.max(0, newDrowsinessLevel - 1);
-        }
-        
-        setDrowsinessLevel(newDrowsinessLevel);
-        
-        // Update alert status
-      if (newDrowsinessLevel > 70) {
-          setAlertStatus("high");
-      } else if (newDrowsinessLevel > 40) {
-          setAlertStatus("medium");
-        } else {
-          setAlertStatus("normal");
-        }
-        
-        // Face is detected in simulation
-        setFaceDetected(true);
-        
-        // Draw status text
-        context.font = '16px Arial';
-        context.fillStyle = 'white';
-        context.fillText(`EAR: ${simulatedEAR.toFixed(2)}`, 10, 30);
-        context.fillText(`Blinks: ${blinkCount}`, 10, 60);
-        context.fillText(`Yawns: ${yawnCount}`, 10, 90);
-        context.fillText(`Mode: Browser Simulation`, 10, 120);
-        
-        // Continue detection loop
-        animationRef.current = requestAnimationFrame(drawVideoFrame);
-      } catch (error: any) {
-        console.error("Error in animation frame:", error);
-        // Try to recover by restarting after a brief delay
-        setTimeout(() => {
-          animationRef.current = requestAnimationFrame(drawVideoFrame);
-        }, 1000);
+      // Need enough samples to analyze
+      if (headPositionBufferRef.current.length < 10) {
+        return false;
       }
-    };
-    
-    drawVideoFrame();
-  };
-
-  // Toggle Python/JS mode
-  const handleModeToggle = async () => {
-    if (isWebcamActive) {
-      const newMode = isLocalMode ? 'backend' : 'local';
-      setSwitchingMode(true);
-      setError(null);
       
-      try {
-        const success = await DrowsinessDetectionController.switchMode(newMode);
-        if (success) {
-          setIsLocalMode(!isLocalMode);
-          setDetectionMode(newMode);
-          console.log(`Switched to ${newMode} mode`);
-        } else {
-          throw new Error(`Failed to switch to ${newMode} mode`);
+      // Detect significant vertical movement (nodding)
+      const positions = headPositionBufferRef.current;
+      let isNodding = false;
+      
+      // Check for head drooping (forward nodding)
+      // This happens when the head position changes significantly downward
+      // and then returns back up - typical of drowsy head nodding
+      
+      if (positions.length >= 10) {
+        // Calculate the average position
+        const avgY = positions.reduce((sum, pos) => sum + pos.y, 0) / positions.length;
+        
+        // Get the max vertical movement in recent frames
+        let maxDownwardMovement = 0;
+        for (let i = 1; i < positions.length; i++) {
+          const movement = positions[i].y - positions[i-1].y;
+          if (movement > maxDownwardMovement) {
+            maxDownwardMovement = movement;
+          }
         }
-      } catch (error: any) {
-        console.error('Error switching modes:', error);
-        setError(`Failed to switch modes: ${error.message || 'Unknown error'}`);
-      } finally {
-        setSwitchingMode(false);
+        
+        // Detect sudden downward movement followed by a return
+        const recentPositions = positions.slice(-5);
+        const recentAvgY = recentPositions.reduce((sum, pos) => sum + pos.y, 0) / recentPositions.length;
+        const verticalDeviation = Math.abs(recentAvgY - avgY);
+        
+        // Check if there's enough vertical movement to be considered a nod
+        if (maxDownwardMovement > HEAD_NOD_THRESHOLD && verticalDeviation > HEAD_NOD_THRESHOLD) {
+          const now = Date.now();
+          // Ensure we don't count the same nod multiple times
+          if (now - lastNodTimestampRef.current > 1000 && !isNodDetectedRef.current) {
+            isNodding = true;
+            isNodDetectedRef.current = true;
+            lastNodTimestampRef.current = now;
+            setNodCount(prev => prev + 1);
+            setTimeout(() => {
+              isNodDetectedRef.current = false;
+            }, 1000);
+          }
+        }
       }
-    } else {
-      // Just toggle the mode setting if webcam is not active yet
-      setIsLocalMode(!isLocalMode);
-      setDetectionMode(!isLocalMode ? 'backend' : 'local');
-    }
-  };
-  
-  // Toggle between local and Python modes
-  const toggleDetectionMode = () => {
-    setPreferLocalMode(!preferLocalMode);
-    
-    // If webcam is active, restart with new mode
-    if (isWebcamActive) {
-      handleStopMonitoring()
-        .then(() => {
-          // Short delay before restarting
-          setTimeout(() => {
-            handleStartMonitoring();
-          }, 1000);
-        });
-    }
-  };
-
-  // Handle starting monitoring
-  const handleStartMonitoring = async () => {
-    // Reset states
-    setBlinkCount(0);
-    setYawnCount(0);
-    setDrowsinessLevel(10);
-    setError(null);
-    
-    // Clean up any existing resources first
-    await cleanupResources();
-    
-    // Start monitoring
-    setIsWebcamActive(true);
-  };
-
-  // Handle stopping monitoring
-  const handleStopMonitoring = async () => {
-    setIsWebcamActive(false);
-    // Full cleanup is handled in the useEffect
-    await disconnectFromPythonBackend();
-  };
-
-  // Start/stop monitoring
-  useEffect(() => {
-    if (isWebcamActive) {
-      let attemptCount = 0;
-      const maxAttempts = 5;
       
-      const initializeMonitoring = () => {
-        // Ensure the DOM has been properly updated
-        setTimeout(() => {
-          if (!videoRef.current && attemptCount < maxAttempts) {
-            console.log(`Video element not ready, retrying... (${attemptCount + 1}/${maxAttempts})`);
-            attemptCount++;
-            initializeMonitoring(); // Retry
-            return;
-          }
-          
-          if (!videoRef.current) {
-            console.error("Video element not available after maximum retry attempts");
-            setError("Could not initialize video element. Please refresh the page and try again.");
-            return;
-          }
-          
-          if (preferLocalMode) {
-            // Start directly with local detection
-            setIsLocalMode(true);
-            startLocalDetection();
-          } else {
-            // Try to connect to Python backend first
-            connectToPythonBackend();
-          }
-        }, 500); // Wait 500ms between attempts
-      };
-      
-      initializeMonitoring();
-    } else {
-      disconnectFromPythonBackend();
+      return isNodding;
+    } catch (error) {
+      console.error("Error detecting head nodding:", error);
+      return false;
+    }
+  };
+
+  // Trigger SOS alert
+  const triggerSOSAlert = () => {
+    if (sosAlertActive) return; // Already triggered
+    
+    setSosAlertActive(true);
+    console.log("🚨 SOS ALERT TRIGGERED! Driver is drowsy and unsafe!");
+    
+    // Play alert sound
+    const audio = new Audio('/alert.mp3');
+    audio.volume = 0.8;
+    try {
+      audio.play().catch(e => console.error("Error playing alert sound:", e));
+    } catch (error) {
+      console.error("Error playing alert sound:", error);
     }
     
-    // Cleanup on component unmount
-    return () => {
-      cleanupResources();
-      DrowsinessDetectionController.stopDetection();
-      setIsDetecting(false);
-      setIsConnected(false);
-    };
-  }, [isWebcamActive, preferLocalMode]);
-
-  // Handle errors from the controller
-  useEffect(() => {
-    const handleError = (event: ErrorEvent) => {
-      // Only handle errors from our controller
-      if (event.message && event.message.includes('TensorFlow.js not found') && isLocalMode) {
-        setError('TensorFlow.js not found. Please load it in your application for browser-based detection.');
-      }
-    };
+    // Vibrate device if supported
+    if (navigator.vibrate) {
+      navigator.vibrate([300, 100, 300, 100, 300]);
+    }
     
-    // Add global error listener
-    window.addEventListener('error', handleError);
-    
-    return () => {
-      window.removeEventListener('error', handleError);
-    };
-  }, [isLocalMode]);
+    // Set timeout to reset the SOS alert after 10 seconds
+    sosTimeoutRef.current = setTimeout(() => {
+      setSosAlertActive(false);
+      drowsinessEventsRef.current = Math.max(0, drowsinessEventsRef.current - 2);
+    }, 10000);
+  };
 
-  // Add a helper method to check if TensorFlow.js is available
-  const isTensorFlowAvailable = (): boolean => {
-    return typeof window !== 'undefined' && 'tf' in window;
+  // Stop SOS alert
+  const stopSOSAlert = () => {
+    setSosAlertActive(false);
+    if (sosTimeoutRef.current) {
+      clearTimeout(sosTimeoutRef.current);
+      sosTimeoutRef.current = null;
+    }
+    drowsinessEventsRef.current = 0;
   };
 
   return (
@@ -641,38 +581,24 @@ export function DrowsinessMonitor() {
       <div className="flex justify-between items-center">
         <button
           className={`px-4 py-2 rounded-md ${
-            isWebcamActive
+            isActive
               ? "bg-gradient-to-r from-red-500 to-red-600 text-white"
               : "bg-gradient-to-r from-green-500 to-green-600 text-white"
           } shadow-md transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed`}
-          onClick={isWebcamActive ? handleStopMonitoring : handleStartMonitoring}
-          disabled={isConnecting}
+          onClick={() => setIsActive(!isActive)}
+          disabled={isModelLoading}
         >
-          {isConnecting ? (
+          {isModelLoading ? (
             <>
               <Loader2 className="h-4 w-4 mr-2 inline animate-spin" />
-              Connecting...
+              Loading models...
             </>
-          ) : isWebcamActive ? (
+          ) : isActive ? (
             "Stop Monitoring"
           ) : (
             "Start Monitoring"
           )}
         </button>
-
-        <div className="flex items-center space-x-4">
-          <div className="flex items-center space-x-2">
-            <Server className={`h-4 w-4 ${preferLocalMode ? 'text-gray-400' : 'text-blue-500'}`} />
-            <Switch 
-              id="detection-mode" 
-              checked={preferLocalMode}
-              onCheckedChange={toggleDetectionMode}
-            />
-            <Smartphone className={`h-4 w-4 ${preferLocalMode ? 'text-blue-500' : 'text-gray-400'}`} />
-            <Label htmlFor="detection-mode" className="text-xs text-gray-600">
-              {preferLocalMode ? "Browser Mode" : "Python Mode"}
-            </Label>
-          </div>
 
         <Badge
           variant="outline"
@@ -686,7 +612,6 @@ export function DrowsinessMonitor() {
           {alertStatus === "normal" ? "Normal" : alertStatus === "medium" ? "Warning" : "Alert"}
         </Badge>
       </div>
-      </div>
 
       {error && (
         <div className="bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 p-3 rounded-md text-sm">
@@ -694,123 +619,85 @@ export function DrowsinessMonitor() {
         </div>
       )}
 
-      {isLocalMode && isWebcamActive && !preferLocalMode && (
-        <div className="bg-yellow-50 dark:bg-yellow-900/20 text-yellow-600 dark:text-yellow-400 p-3 rounded-md text-sm">
-          <p>Running in browser-based simulation mode. For best results with Python backend:</p>
-          <ol className="list-decimal ml-5 mt-1">
-            <li>Run the Python backend (run_project.py)</li>
-            <li>Restart monitoring</li>
-          </ol>
-        </div>
-      )}
+      <div className="aspect-video bg-gradient-to-br from-gray-900 to-blue-900 rounded-md flex items-center justify-center relative shadow-lg overflow-hidden">
+        <video
+          ref={videoRef}
+          className="absolute inset-0 w-full h-full object-cover"
+          playsInline
+          muted
+          style={{ transform: "scaleX(-1)" }}
+        />
+        
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full object-cover"
+          style={{ transform: "scaleX(-1)" }}
+        />
 
-      {isWebcamActive ? (
-        <div className="aspect-video bg-gradient-to-br from-gray-900 to-blue-900 rounded-md flex items-center justify-center relative shadow-lg overflow-hidden">
-          {/* Python backend stream */}
-          {!isLocalMode && streamUrl && (
-            <img 
-              ref={imageRef}
-              src={streamUrl}
-              className="absolute inset-0 w-full h-full object-cover"
-              alt="Drowsiness detection feed"
-              onError={(e) => {
-                console.error("Image load error, falling back to local mode");
-                e.currentTarget.style.display = 'none';
-                if (apiStatus === "connected") {
-                  setApiStatus("failed");
-                  setError("Video stream error. Switching to browser-based detection.");
-                  setIsLocalMode(true);
-                  startLocalDetection();
-                }
-              }}
-            />
-          )}
-          
-          {/* Video element for both modes */}
-          <video
-            ref={videoRef}
-            className={`absolute inset-0 w-full h-full object-cover ${!isLocalMode ? 'hidden' : ''}`}
-            playsInline
-            muted
-            style={{ transform: "scaleX(-1)" }}
-            onError={(e) => {
-              console.error("Video error:", e);
-              setError("Camera error: " + (e.currentTarget.error?.message || "Unknown error"));
-            }}
-          />
-          
-          {/* Canvas for local detection */}
-          {isLocalMode && (
-            <canvas 
-              ref={canvasRef}
-              className="absolute inset-0 w-full h-full object-cover"
-              style={{ transform: "scaleX(-1)" }}
-            />
-          )}
-
-          {!faceDetected && isWebcamActive && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/50">
-              <div className="text-white text-center p-4">
-                <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
-                <p>No face detected</p>
-                <p className="text-xs mt-1">Please position your face in the camera view</p>
-              </div>
+        {!faceDetected && isActive && (
+          <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+            <div className="text-white text-center p-4">
+              <AlertTriangle className="h-8 w-8 mx-auto mb-2" />
+              <p>No face detected</p>
+              <p className="text-xs mt-1">Please position your face in the camera view</p>
             </div>
-          )}
+          </div>
+        )}
 
-          {/* Overlay for drowsiness indicators */}
-          <div className="absolute bottom-2 left-2 right-2 bg-black/70 backdrop-blur-sm text-white p-3 rounded-md text-xs">
-            <div className="flex justify-between mb-1">
-              <span>Drowsiness Level:</span>
-              <span>{drowsinessLevel}%</span>
+        {!isActive && !isModelLoading && (
+          <div className="text-white text-center p-4">
+            <Eye className="h-8 w-8 mx-auto mb-2" />
+            <p>Camera is off</p>
+            <p className="text-xs mt-1">Click "Start Monitoring" to begin</p>
+          </div>
+        )}
+
+        {isModelLoading && (
+          <div className="text-white text-center p-4">
+            <Loader2 className="h-8 w-8 mx-auto mb-2 animate-spin" />
+            <p>Loading detection models...</p>
+            <p className="text-xs mt-1">This may take a few seconds</p>
+          </div>
+        )}
+
+        <div className="absolute bottom-2 left-2 right-2 bg-black/70 backdrop-blur-sm text-white p-3 rounded-md text-xs">
+          <div className="flex justify-between mb-1">
+            <span>Drowsiness Level:</span>
+            <span>{drowsinessLevel}%</span>
+          </div>
+          <Progress value={drowsinessLevel} className="h-1.5 mb-2">
+            <div
+              className="h-full bg-gradient-to-r from-green-500 via-yellow-500 to-red-500 rounded-full"
+              style={{ width: `${drowsinessLevel}%` }}
+            />
+          </Progress>
+
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+            <div className="flex justify-between">
+              <span>EAR Value:</span>
+              <span className="font-medium">{earValue}</span>
             </div>
-            <Progress value={drowsinessLevel} className="h-1.5 mb-2">
-              <div
-                className="h-full bg-gradient-to-r from-green-500 via-yellow-500 to-red-500 rounded-full"
-                style={{ width: `${drowsinessLevel}%` }}
-              />
-            </Progress>
-
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-              <div className="flex justify-between">
-                <span>EAR Value:</span>
-                <span className="font-medium">{earValue}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Blinks:</span>
-                <span className="font-medium">{blinkCount}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Yawns:</span>
-                <span className="font-medium">{yawnCount}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>Mode:</span>
-                <span className="truncate font-medium">
-                  {isLocalMode ? "Browser" : "Python"}
-                </span>
-              </div>
+            <div className="flex justify-between">
+              <span>Blinks:</span>
+              <span className="font-medium">{blinkCount}</span>
+            </div>
+            <div className="flex justify-between">
+              <span>Status:</span>
+              <span className={`font-medium ${
+                alertStatus === "normal" ? "text-green-400" : 
+                alertStatus === "medium" ? "text-yellow-400" : "text-red-400"
+              }`}>
+                {alertStatus === "normal" ? "Alert" : 
+                 alertStatus === "medium" ? "Drowsy" : "Very Drowsy"}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span>Mode:</span>
+              <span className="truncate font-medium">Browser</span>
             </div>
           </div>
         </div>
-      ) : (
-        <div className="aspect-video bg-gradient-to-br from-gray-100 to-blue-50 dark:from-gray-800 dark:to-gray-700 rounded-md flex flex-col items-center justify-center shadow-md">
-          {apiStatus === "connecting" ? (
-            <>
-              <Loader2 className="h-12 w-12 text-blue-400 mb-2 animate-spin" />
-              <p className="text-gray-600 dark:text-gray-300">Connecting to drowsiness detection...</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Starting {preferLocalMode ? "browser" : "Python"} mode</p>
-            </>
-          ) : (
-            <>
-              <PlayCircle className="h-12 w-12 text-blue-400 mb-2" />
-          <p className="text-gray-600 dark:text-gray-300">Camera is turned off</p>
-              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">Click "Start Monitoring" to begin</p>
-              <p className="text-xs text-blue-500 dark:text-blue-400 mt-2">Using {preferLocalMode ? "browser-based" : "Python backend"} detection</p>
-            </>
-          )}
-        </div>
-      )}
+      </div>
 
       <div className="grid grid-cols-2 gap-2">
         <Card className="border-none shadow-md bg-white dark:bg-gray-800">
@@ -821,7 +708,7 @@ export function DrowsinessMonitor() {
                 <span className="text-sm font-medium text-blue-700 dark:text-blue-300">Blink Rate</span>
               </div>
               <span className="text-sm bg-blue-50 dark:bg-blue-900/30 px-2 py-0.5 rounded-full text-blue-700 dark:text-blue-300">
-                {isWebcamActive ? `${blinkCount} blinks` : "N/A"}
+                {isActive ? `${blinkCount} blinks` : "N/A"}
               </span>
             </div>
           </CardContent>
@@ -832,15 +719,41 @@ export function DrowsinessMonitor() {
             <div className="flex items-center justify-between">
               <div className="flex items-center">
                 <AlertTriangle className="h-4 w-4 mr-2 text-yellow-500" />
-                <span className="text-sm font-medium text-yellow-700 dark:text-yellow-300">Yawn Count</span>
+                <span className="text-sm font-medium text-yellow-700 dark:text-yellow-300">Alertness</span>
               </div>
-              <span className="text-sm bg-yellow-50 dark:bg-yellow-900/30 px-2 py-0.5 rounded-full text-yellow-700 dark:text-yellow-300">
-                {isWebcamActive ? `${yawnCount} yawns` : "N/A"}
+              <span className={`text-sm px-2 py-0.5 rounded-full ${
+                alertStatus === "normal" 
+                  ? "bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300" 
+                  : alertStatus === "medium"
+                  ? "bg-yellow-50 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-300"
+                  : "bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300"
+              }`}>
+                {isActive ? (
+                  alertStatus === "normal" ? "Good" : alertStatus === "medium" ? "Moderate" : "Low"
+                ) : "N/A"}
               </span>
             </div>
           </CardContent>
         </Card>
       </div>
+
+      {/* SOS Alert Overlay */}
+      {sosAlertActive && (
+        <div className="fixed inset-0 bg-red-600/80 flex items-center justify-center z-50 animate-pulse">
+          <div className="bg-white p-8 rounded-lg max-w-md text-center">
+            <AlertTriangle className="h-16 w-16 text-red-600 mx-auto mb-4" />
+            <h2 className="text-2xl font-bold text-red-600 mb-2">EMERGENCY ALERT</h2>
+            <p className="text-lg mb-4">Driver appears to be drowsy!</p>
+            <p className="text-sm mb-6">Please pull over safely or take a break.</p>
+            <button
+              className="px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 transition-colors"
+              onClick={stopSOSAlert}
+            >
+              Acknowledge
+            </button>
+          </div>
+        </div>
+      )}
     </div>
-  )
+  );
 }

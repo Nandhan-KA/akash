@@ -5,6 +5,9 @@ A modern web application for monitoring driver drowsiness, emotions, phone usage
 ## Features
 
 - **Drowsiness Detection**: Real-time eye tracking and drowsiness detection
+  - Eye closure duration monitoring
+  - Head nodding detection
+  - Emergency SOS alerts for dangerous drowsiness
 - **Emotion Recognition**: Facial expression analysis to determine driver emotions
 - **Phone Usage Detection**: Detects if the driver is using a phone
 - **Heart Rate Monitoring**: Monitors driver's heart rate and detects abnormal patterns
@@ -69,6 +72,19 @@ npm run dev
 ```
 
 The application will be available at [http://localhost:3000](http://localhost:3000).
+
+### Alert Sound
+
+The system requires an alert sound file for the drowsiness SOS feature:
+
+1. Download an emergency alert sound in MP3 format
+2. Rename it to `alert.mp3`
+3. Place it in the `public` folder of the project
+
+You can find free alert sounds on websites like:
+- [Uppbeat.io](https://uppbeat.io/sfx/category/emergency)
+- [Mixkit](https://mixkit.co/free-sound-effects/alert/)
+- [Freesound](https://freesound.org/search/?q=alert)
 
 ## API Endpoints
 

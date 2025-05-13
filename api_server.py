@@ -3,7 +3,7 @@ API Server for Driver Drowsiness and Emotion Monitoring System
 Provides REST API endpoints for the frontend UI
 """
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 import cv2
 import base64
@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='new_project/build', static_url_path='')
 CORS(app)  # Enable CORS for all routes
 
 # Thread lock for thread safety
@@ -553,6 +553,36 @@ def cleanup():
 # Register cleanup function to run at exit
 import atexit
 atexit.register(cleanup)
+
+@app.route('/detect/status', methods=['GET', 'OPTIONS'])
+def detect_status():
+    """Status endpoint for the frontend detector"""
+    # Handle OPTIONS requests for CORS preflight
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        response.headers.add('Access-Control-Allow-Methods', 'GET')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+        
+    return jsonify({
+        "status": "online",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/detect', methods=['POST', 'OPTIONS'])
+def detect_frame():
+    """Compatibility endpoint that forwards to /api/frame"""
+    # Handle OPTIONS requests for CORS preflight
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        response.headers.add('Access-Control-Allow-Methods', 'POST')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        return response
+        
+    # Forward to the process_frame function
+    return process_frame()
 
 if __name__ == '__main__':
     logger.info("Starting API server on port 5000")

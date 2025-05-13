@@ -31,7 +31,7 @@ async function initialize(backendUrl) {
     const timeoutId = setTimeout(() => controller.abort(), 5000);
     
     try {
-      const response = await fetch(`${apiUrl}/status`, {
+      const response = await fetch(`${apiUrl}/detect/status`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -134,7 +134,7 @@ async function processFrame(videoElement, onDrowsinessChange = null) {
     frameCache = frameData;
     
     // Send frame to the backend for processing
-    const response = await fetch(`${apiUrl}/detect`, {
+    const response = await fetch(`${apiUrl}/api/frame`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -152,8 +152,8 @@ async function processFrame(videoElement, onDrowsinessChange = null) {
     
     // Parse the response
     const prediction = {
-      isDrowsy: data.isDrowsy,
-      confidence: data.confidence,
+      isDrowsy: data.is_drowsy || data.isDrowsy || false,
+      confidence: data.confidence || (data.drowsiness_level ? data.drowsiness_level / 100 : 0),
       timestamp: Date.now()
     };
     
